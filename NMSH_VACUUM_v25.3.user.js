@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         N*M*S*H*N VACUUM
 // @namespace    http://tampermonkey.net/
-// @version      25.3
+// @version      25.4
 // @description  VACUUM — Maximum performance HIT catcher. Worker ID licensed.
 // @author       MRPsoft
 // @match        https://worker.mturk.com/*
@@ -24,7 +24,7 @@
     'use strict';
 
     var TOOL_NAME   = 'N*M*S*H*N';
-    var VERSION     = '25.3';
+    var VERSION     = '25.4';
     var STORAGE_KEY = 'mrp_v14';
     var WAS_RUNNING = 'mrp_was_running';
     var CAP_RESUME  = 'mrp_cap_resume';   // separate from WAS_RUNNING so startScan can't clobber it
@@ -78,20 +78,28 @@
     }
 
     // ================================================================
-    //  CSV PARSER — splits lines into columns
+    //  CSV PARSER — RFC 4180 compliant: handles quoted fields, escaped
+    //  quotes ("" → "), and quoted commas. Skips empty lines.
     // ================================================================
     function parseCSV(txt){
         // Strip UTF-8 BOM that Google Sheets sometimes prepends
         txt = (txt || '').replace(/^\uFEFF/, '');
         var rows = [];
         txt.split('\n').forEach(function(line){
-            line = line.trim(); if (!line) return;
+            // v25.4: only trim CR — preserve significant whitespace inside fields,
+            // but strip trailing \r from CRLF endings.
+            line = line.replace(/\r$/, '');
+            if (!line) return;
             var cols = [], inQ = false, cur = '';
             for (var i = 0; i < line.length; i++){
                 var c = line[i];
-                if (c === '"'){ inQ = !inQ; }
-                else if (c === ',' && !inQ){ cols.push(cur.trim()); cur = ''; }
-                else cur += c;
+                if (c === '"'){
+                    // RFC 4180: a doubled quote inside a quoted field is an escaped quote
+                    if (inQ && line[i + 1] === '"'){ cur += '"'; i++; }
+                    else inQ = !inQ;
+                } else if (c === ',' && !inQ){
+                    cols.push(cur.trim()); cur = '';
+                } else cur += c;
             }
             cols.push(cur.trim());
             rows.push(cols);
@@ -712,12 +720,28 @@
             },
             stopRepeating: function(){ if (this.alertTimer){ clearInterval(this.alertTimer); this.alertTimer = null; } },
             showOverlay: function(){
+                var s = this;
                 var ex = document.getElementById('mrp-cap-ov'); if (ex) ex.remove();
                 var ov = document.createElement('div'); ov.id = 'mrp-cap-ov';
                 ov.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647';
-                ov.innerHTML = '<div style="background:#c0392b;color:#fff;padding:10px;text-align:center;font:bold 16px system-ui;box-shadow:0 3px 15px rgba(0,0,0,.4)">CAPTCHA — SOLVE NOW' +
-                    '<span style="display:block;font-size:11px;opacity:.8;margin-top:3px">' + (this.isCaptchaTab ? 'Tab closes after solve' : 'Scan auto-resumes after solve') + '</span>' +
-                    '<button onclick="this.parentElement.parentElement.remove()" style="margin-left:12px;padding:3px 10px;background:#fff;color:#c0392b;border:none;border-radius:3px;font-weight:bold;cursor:pointer">OK</button></div>';
+                // v25.4: build via DOM (no inline onclick — CSP-safe) and the OK
+                // button MUST silence the recurring alert tone, not just hide the bar.
+                var bar = document.createElement('div');
+                bar.style.cssText = 'background:#c0392b;color:#fff;padding:10px;text-align:center;font:bold 16px system-ui;box-shadow:0 3px 15px rgba(0,0,0,.4)';
+                bar.appendChild(document.createTextNode('CAPTCHA — SOLVE NOW'));
+                var sub = document.createElement('span');
+                sub.style.cssText = 'display:block;font-size:11px;opacity:.8;margin-top:3px';
+                sub.textContent = this.isCaptchaTab ? 'Tab closes after solve' : 'Scan auto-resumes after solve';
+                bar.appendChild(sub);
+                var btn = document.createElement('button');
+                btn.textContent = 'OK';
+                btn.style.cssText = 'margin-left:12px;padding:3px 10px;background:#fff;color:#c0392b;border:none;border-radius:3px;font-weight:bold;cursor:pointer';
+                btn.addEventListener('click', function(){
+                    s.stopRepeating();   // <-- silence the 20s tone loop
+                    ov.remove();
+                });
+                bar.appendChild(btn);
+                ov.appendChild(bar);
                 if (document.body) document.body.appendChild(ov);
             },
             removeOverlay: function(){ var el = document.getElementById('mrp-cap-ov'); if (el) el.remove(); },
@@ -770,11 +794,18 @@
             },
             startProbe: function(){
                 var s = this; this.stopProbe();
-                // FIX: don't fire probe immediately on start — wait 60s first
-                setTimeout(function(){ if (runtime.isRunning) s.probe(); }, 60000);
+                // v25.4: track the initial setTimeout handle so stopProbe can cancel
+                // it. Without this, fast start/stop cycles leak delayed probes.
+                this.probeInitTimer = setTimeout(function(){
+                    s.probeInitTimer = null;
+                    if (runtime.isRunning) s.probe();
+                }, 60000);
                 this.probeTimer = setInterval(function(){ s.probe(); }, s.probeInterval);
             },
-            stopProbe: function(){ if (this.probeTimer){ clearInterval(this.probeTimer); this.probeTimer = null; } },
+            stopProbe: function(){
+                if (this.probeTimer){ clearInterval(this.probeTimer); this.probeTimer = null; }
+                if (this.probeInitTimer){ clearTimeout(this.probeInitTimer); this.probeInitTimer = null; }
+            },
             probe: function(){
                 if (this.captchaActive || this.isCaptchaTab) return;
                 var n = now(); if (n - this.lastProbe < 300000) return; this.lastProbe = n;
@@ -798,8 +829,14 @@
                 }
                 if (sessionStorage.getItem('mrp_cap_tab') === '1') this.isCaptchaTab = true;
 
+                // v25.4: guard against double-attach. With @run-at document-end the
+                // body usually exists already, so the synchronous onReady() runs;
+                // if DOMContentLoaded then fires later we'd start two scan intervals.
+                var _readyDone = false;
                 function onReady(){
+                    if (_readyDone) return;
                     if (!document.body) return;
+                    _readyDone = true;
                     if (s.isCaptchaTab){
                         if (s.hasCaptchaOnPage()){ s.showOverlay(); s.startRepeating(); s.startSolveMonitor(); }
                         else setTimeout(function(){
@@ -920,17 +957,18 @@
         var saveDebounce = null, knownRequesters = {}, queuedGroupIds = {};
         var queuedGroupTimestamps = {}; // gid → update-time when blocked (re-post detection)
         var lastQueueSync = 0, lastScanTime = 0, syncRunning = false, _lastBatchPrune = 0; // v25.1
-        var acceptedRecently = {}, acceptLocks = {}, urlPatterns = [], urlPtr = 0;
+        var acceptedRecently = {}, acceptLocks = {};
         // batchGroupIds: tracks HITs with >100 slots — these bypass queuedGroupIds gate
         // when queue has free slots, allowing the queue to be filled fully from one batch
         var batchGroupIds = {};
+        // v25.4: per-gid accept counter so the batch catcher can detect "this
+        // specific batch stopped producing accepts" instead of "no HIT anywhere
+        // got accepted in 600ms" (which is wrong when other scanners are firing).
+        var acceptCountByGid = {};
         var _megaWasRunning = false; // v24.8: tracks whether scan was running BEFORE MEGA-ON so MEGA-OFF can resume correctly
 
         // Qualification filtering removed — was silently causing missed HITs.
         // All HITs blast at full power. MTurk returns 422 if not qualified.
-        var qualCacheReady = true;
-        var qualCacheAttempted = true;
-        function fetchQualCache(){}
 
         // ================================================================
         //  429 AUTO-RELOAD — fires when 429 count hits threshold
@@ -1126,6 +1164,10 @@
             return (list||[]).filter(Boolean).map(function(b){ return (b.id||'__NOID__')+'|'+(b.name||'').toLowerCase().trim(); }).sort().join(',');
         }
 
+        // v25.4: writeInFlight blocks the poller from acting on stale reads
+        // until our POST has had time to propagate. Eliminates the race where a
+        // freshly-added local block was wiped by an old remote read.
+        var _blockWriteInFlight = 0; // timestamp until which the poller must ignore remote data
         function writeBlocklistSignal(){
             if (!SYNC_API_URL || !_teamKey || _teamKey === 'DEFAULT') return;
             // Store id+name only — keep payload small
@@ -1133,7 +1175,9 @@
                 return { id: b.id || '', name: b.name || '' };
             }).slice(0, 60); // cap at 60 entries
             var val = JSON.stringify(compact);
-            _lastBlockHash = _blockHash(compact);
+            var localHash = _blockHash(compact);
+            // Block poller for 12s — Apps Script + Google Sheet propagation can take ~5-10s
+            _blockWriteInFlight = now() + 12000;
             // v25.2: POST to avoid Google Apps Script 2KB GET URL limit (60 entries can be 3-4KB)
             GM_xmlhttpRequest({
                 method: 'POST',
@@ -1141,7 +1185,15 @@
                 headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
                 data: JSON.stringify({ val: val }),
                 timeout: 8000,
-                onload: function(){}, onerror: function(){}
+                onload: function(){
+                    // Only update _lastBlockHash AFTER confirmed POST — this prevents
+                    // a stale remote read from matching the in-flight hash.
+                    _lastBlockHash = localHash;
+                },
+                onerror: function(){
+                    // POST failed — release the write lock so poller can sync again
+                    _blockWriteInFlight = 0;
+                }
             });
         }
 
@@ -1167,6 +1219,10 @@
         function applyTeamBlocklist(list){
             // v25.3: guard empty list — [] response (API blip) must NOT wipe blocks
             if (!list || !list.length) return;
+            // v25.4: block all reconciliation while a local POST is in flight.
+            // The remote may still hold the pre-POST state and would otherwise
+            // wipe the entry the user just added.
+            if (now() < _blockWriteInFlight) return;
             var hash = _blockHash(list);
             if (hash === _lastBlockHash) return; // no change
             _lastBlockHash = hash;
@@ -1401,9 +1457,13 @@
         }
         function esc(s){
             if (!s) return '';
+            // v25.4: createTextNode + innerHTML escapes <, >, & — but NOT " or '.
+            // Several call sites embed esc() output into HTML attributes
+            // (data-rid, data-rn, value=). Without escaping " a requester name
+            // containing a double-quote would break out of the attribute.
             var d = document.createElement('div');
             d.appendChild(document.createTextNode(String(s)));
-            return d.innerHTML;
+            return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
         }
         function gel(id){ return document.getElementById(id); }
         function getHPM(){
@@ -1659,65 +1719,62 @@
 
             function onSucc(body, furl, respUrl){
                 if (resolved) return;
-                // resolved only set INSIDE each success tier — NOT here at the top.
-                // If none match, leave resolved=false so other in-flight blasts still process.
 
                 var bl = (body || '').toLowerCase();
                 var fu = (furl    || '').toLowerCase();
                 var ru = (respUrl || '').toLowerCase();
 
-                // TIER 1: redirect to /tasks/ — definitive accept for ALL HIT types
+                // TIER 1: redirect to /tasks/ — DEFINITIVE accept for ALL HIT types.
+                // The only fully reliable signal — body parsing is fallback.
                 if ((fu.indexOf('/tasks/') > -1 && fu.indexOf('accept_random') === -1) ||
                     (ru.indexOf('/tasks/') > -1 && ru.indexOf('accept_random') === -1)){
-                    if (resolved) return;
                     resolved = true; cancelSiblingBlasts(); delete acceptLocks[groupId];
                     onAccepted(groupId, hitInfo, '');
                     return;
                 }
 
-                // TIER 2: turkSubmitTo in body — external HITs
-                if (bl.indexOf('turksubmitto') > -1){
-                    if (resolved) return;
+                // v25.4: body-content tiers must FIRST verify the body is NOT a known
+                // rejection page. MTurk error pages can contain marker substrings
+                // (e.g. crowd-form in nav, "assignment_id" in JS configs) which would
+                // cause false-positive accepts. Reject-phrase pre-check eliminates this.
+                var rejectPhrases = [
+                    'no more available hits','no hits available','there are no more',
+                    'already accepted the maximum','you have already accepted',
+                    'continue shopping','this hit is no longer available',
+                    'you are not qualified','this group has no more',
+                    'this hit has been deleted','hit is no longer available',
+                    'maximum assignments','you\'ve already accepted',
+                    'opfcaptcha','validatecaptcha','captchacharacters'
+                ];
+                for (var rp = 0; rp < rejectPhrases.length; rp++){
+                    if (bl.indexOf(rejectPhrases[rp]) > -1) return; // not accepted, leave resolved=false
+                }
+
+                // TIER 2: assignmentId in form (real task page artifact, very specific)
+                if (bl.length > 1500 &&
+                    (/name="assignmentid"\s+value="[a-z0-9]{10,}"/i.test(body || '') ||
+                     /"assignment_id"\s*:\s*"[a-z0-9]{10,}"/i.test(body || ''))){
                     resolved = true; cancelSiblingBlasts(); delete acceptLocks[groupId];
                     onAccepted(groupId, hitInfo, '');
                     return;
                 }
 
-                // TIER 3: crowd-form / hit-wrapper — internal HITs
-                if (bl.indexOf('crowd-form') > -1 || bl.indexOf('id="hit-wrapper"') > -1 ||
-                    bl.indexOf('id="task-content"') > -1 || bl.indexOf('data-task-id') > -1){
-                    if (resolved) return;
+                // TIER 3: turkSubmitTo (external HIT iframe wrapper) + substantial body
+                if (bl.length > 1500 && bl.indexOf('turksubmitto') > -1){
                     resolved = true; cancelSiblingBlasts(); delete acceptLocks[groupId];
                     onAccepted(groupId, hitInfo, '');
                     return;
                 }
 
-                // TIER 4: assignment_id in substantial body
-                if (bl.length > 1500 && (bl.indexOf('"assignment_id"') > -1 || bl.indexOf("'assignment_id'") > -1)){
-                    if (resolved) return;
+                // TIER 4: internal task DOM markers — both required to avoid nav-bar matches
+                if (bl.length > 1500 &&
+                    (bl.indexOf('crowd-form') > -1 && bl.indexOf('crowd-button') > -1)){
                     resolved = true; cancelSiblingBlasts(); delete acceptLocks[groupId];
                     onAccepted(groupId, hitInfo, '');
                     return;
                 }
 
-                // v25.0 TIER 5: externalSubmit / mturk_form / taskcontentbody
-                if (bl.length > 2000 && (bl.indexOf('externalsubmit') > -1 || bl.indexOf('mturk_form') > -1 || bl.indexOf('id="taskcontentbody"') > -1)){
-                    if (resolved) return;
-                    resolved = true; cancelSiblingBlasts(); delete acceptLocks[groupId];
-                    onAccepted(groupId, hitInfo, ''); return;
-                }
-
-                // v25.0 TIER 6: iframe external HIT content / react props
-                if (bl.length > 1000 && (bl.indexOf('id="hit-external-content"') > -1 || bl.indexOf('data-react-props') > -1)){
-                    if (resolved) return;
-                    resolved = true; cancelSiblingBlasts(); delete acceptLocks[groupId];
-                    onAccepted(groupId, hitInfo, ''); return;
-                }
-
-                // v25.1 FIX: do NOT set acceptedRecently on failed accept.
-                // acceptedRecently on failure silences ALL other scanners for 150ms
-                // even though the HIT was never actually accepted — causing misses.
-                // acceptedRecently is now only set in onAccepted (on real success).
+                // No match — leave resolved=false so other in-flight blasts can win.
             }
 
             function onFail(status, body){
@@ -1865,6 +1922,8 @@
 
         function onAccepted(gid, hitInfo, assignId){
             runtime.acceptedCount++;
+            // v25.4: bump per-gid counter so batch catcher can detect its own progress
+            acceptCountByGid[gid] = (acceptCountByGid[gid] || 0) + 1;
             runtime.lastMinuteAccepts.push(now());
             var title = hitInfo ? (hitInfo.title || 'HIT') : 'HIT';
             var reward = hitInfo ? (hitInfo.reward || '0.00') : '0.00';
@@ -2072,16 +2131,9 @@
         }
 
         // ================================================================
-        //  DASHBOARD HTML SCANNER — REMOVED in v16.3
-        //  Root cause: HTML parsing produced hit objects with no requester
-        //  info. isBlocked('','') always returns false → ALL blocked
-        //  requesters passed through. 6 dedicated JSON scanners cover the
-        //  same HITs without this bypass vulnerability.
+        //  Dashboard HTML scanner removed in v16.3 (no requester info →
+        //  bypassed blocklist). JSON scanners cover the same surface.
         // ================================================================
-        var dashScanTimer = null;
-        function runDashScanner(){}
-        function startDashScanner(){}
-        function stopDashScanner(){ if (dashScanTimer){ clearTimeout(dashScanTimer); dashScanTimer = null; } }
 
         // ================================================================
         //  DEDICATED SCANNER URLS — v16.6
@@ -2227,14 +2279,19 @@
                     timeout: 2500,
                     onload: function(r){
                         runtime.scanSpeed = now() - t0;
+                        // v25.4: capture body once — captcha pages can return any status
+                        var _body = r.responseText || '';
+                        // Captcha may arrive with any status code — check first.
+                        if (captchaSystem.hasCaptchaInText(_body)){ captchaSystem.openTab(); return; }
                         if (r.status === 429 || r.status === 503){ recordScannerBackoff(id); scannerTimers[id] = setTimeout(function(){ runScanner(id); }, 600); return; }
-                        if (r.status === 422){ recordScannerBackoff(id); scannerTimers[id] = setTimeout(function(){ runScanner(id); }, 300); return; }
-                        if (captchaSystem.hasCaptchaInText(r.responseText || '')){ captchaSystem.openTab(); return; }
-                        if ((r.responseText||'').indexOf('Continue shopping') > -1){ recordScannerBackoff(id); scannerTimers[id] = setTimeout(function(){ runScanner(id); }, 600); return; }
+                        // v25.4: 422 = not qualified / queue full — NOT a rate-limit, do
+                        // not record backoff. Aligns with the fetch path.
+                        if (r.status === 422){ runtime.consecutiveErrors = 0; scannerTimers[id] = setTimeout(function(){ runScanner(id); }, state.scanDelay); return; }
+                        if (_body.indexOf('Continue shopping') > -1){ recordScannerBackoff(id); scannerTimers[id] = setTimeout(function(){ runScanner(id); }, 600); return; }
                         if (r.status !== 200){ runtime.consecutiveErrors++; scannerTimers[id] = setTimeout(function(){ runScanner(id); }, 300); return; }
                         runtime.consecutiveErrors = 0;
-                        try { processResults(JSON.parse(r.responseText).results || []); } catch(e){}
-                                                scannerTimers[id] = setTimeout(function(){ runScanner(id); }, state.scanDelay);
+                        try { processResults(JSON.parse(_body).results || []); } catch(e){}
+                        scannerTimers[id] = setTimeout(function(){ runScanner(id); }, state.scanDelay);
                     },
                     onerror:   function(){ runtime.consecutiveErrors++; scannerTimers[id] = setTimeout(function(){ runScanner(id); }, 400); },
                     ontimeout: function(){ runtime.consecutiveErrors++; scannerTimers[id] = setTimeout(function(){ runScanner(id); }, 400); }
@@ -2266,13 +2323,19 @@
                 }
             }).then(function(resp){
                 clearTimeout(fetchTimeout);
+                // v25.4: clear our controller slot — leaving stale aborts in
+                // fetchControllers prevents stopScanners from cleaning up cleanly.
+                if (fetchControllers[id] === ctrl) delete fetchControllers[id];
                 runtime.scanSpeed = now() - t0;
                 if (resp.status === 429 || resp.status === 503){
                     recordScannerBackoff(id);
                     scannerTimers[id] = setTimeout(function(){ runScanner(id); }, 600);
                     return;
                 }
-                if (resp.status === 422){ scannerTimers[id] = setTimeout(function(){ runScanner(id); }, 300); return; } // 422 = rate/auth, not captcha
+                // v25.4: 422 = not qualified / queue full — reset consecutiveErrors
+                // (it's a healthy scan, just nothing for us). Schedule normal next
+                // scan, not the 300ms penalty box.
+                if (resp.status === 422){ runtime.consecutiveErrors = 0; scannerTimers[id] = setTimeout(function(){ runScanner(id); }, state.scanDelay); return; }
                 if (resp.status !== 200){
                     runtime.consecutiveErrors++;
                     scannerTimers[id] = setTimeout(function(){ runScanner(id); }, 300);
@@ -2288,6 +2351,7 @@
                 });
             }).catch(function(e){
                 clearTimeout(fetchTimeout);
+                if (fetchControllers[id] === ctrl) delete fetchControllers[id];
                 if (e && e.name === 'AbortError'){
                     // Aborted by timeout (5s) or by stopScanners — reschedule only if still running
                     if (runtime.isRunning && !captchaSystem.captchaActive){
@@ -2327,9 +2391,13 @@
         function startGroupCatchers(){ stopGroupCatchers(); state.watchList.forEach(function(w){ if (w.type === 'group') startOneGroup(w.id); }); }
         function startOneGroup(gid){
             if (groupTimers[gid]) return;
+            // v25.4: pass a stub hitInfo with hitCount=999 so onAccepted treats this
+            // like a multi-slot HIT (300ms cooldown) instead of single-slot (8s).
+            // Watched groups are explicitly user-curated — they should re-fire fast.
+            var stubInfo = { title: 'Watched ' + gid.substring(0,10), hitCount: 999, groupId: gid };
             groupTimers[gid] = setInterval(function(){
                 if (runtime.isRunning && !captchaSystem.captchaActive && !isMegaGlobalOn() && !queuedGroupIds[gid])
-                    fireAccept(gid, null, 10);
+                    fireAccept(gid, stubInfo, 10);
             }, 100); // 100ms fixed — independent of favorite focus speed
         }
         // Dedicated tight-loop for auto-detected batch HITs (>100 slots)
@@ -2337,25 +2405,29 @@
         function startOneBatchCatcher(gid, hitInfo){
             if (groupTimers[gid]) return;
             log('■ BATCH — auto-loop: ' + (hitInfo && hitInfo.title ? hitInfo.title.substring(0,24) : gid), 'warning');
-            var _batchFails = 0, _batchLastAccept = now(); // v25.0: termination counters
+            var _batchFails = 0, _batchLastAccept = now(); // termination counters
+            // v25.4: track THIS batch's accept count (not the global counter), so
+            // unrelated accepts on other scanners can't trick us into thinking the
+            // batch is still producing.
+            acceptCountByGid[gid] = acceptCountByGid[gid] || 0;
             groupTimers[gid] = setInterval(function(){
                 if (!runtime.isRunning || captchaSystem.captchaActive || isMegaGlobalOn()){ return; }
-                if (!batchGroupIds[gid]){ clearInterval(groupTimers[gid]); delete groupTimers[gid]; return; }
-                // v25.0 FIX: stop after 60s no accepts or 200 consecutive non-accepts
+                if (!batchGroupIds[gid]){ clearInterval(groupTimers[gid]); delete groupTimers[gid]; delete acceptCountByGid[gid]; return; }
+                // Stop after 60s with no accepts FOR THIS gid, or 200 consecutive non-accepts
                 if (now() - _batchLastAccept > 60000 || _batchFails > 200){
                     log('Batch loop ended: ' + (hitInfo && hitInfo.title ? hitInfo.title.substring(0,20) : gid), 'info');
-                    delete batchGroupIds[gid]; clearInterval(groupTimers[gid]); delete groupTimers[gid]; return;
+                    delete batchGroupIds[gid]; clearInterval(groupTimers[gid]); delete groupTimers[gid]; delete acceptCountByGid[gid]; return;
                 }
-                // v25.1: snapshot before fire, use dedicated per-fire closure to avoid race
+                // v25.4: snapshot THIS gid's count, fire, check after settle delay
                 (function(){
-                    var _snap = runtime.acceptedCount;
+                    var _snap = acceptCountByGid[gid] || 0;
                     fireAccept(gid, hitInfo, 8);
                     setTimeout(function(){
-                        if (runtime.acceptedCount === _snap) _batchFails++;
+                        if ((acceptCountByGid[gid] || 0) === _snap) _batchFails++;
                         else { _batchFails = 0; _batchLastAccept = now(); }
-                    }, 600); // v25.1: 600ms check (was 500) — clears the 120ms overlap
+                    }, 600);
                 })();
-            }, 120); // v25.0: 120ms (was 150ms)
+            }, 120);
         }
         function stopGroupCatchers(){ Object.keys(groupTimers).forEach(function(g){ clearInterval(groupTimers[g]); }); groupTimers = {}; }
 
@@ -2529,9 +2601,12 @@
                     });
                 }
 
-                // Clear stale acceptedRecently — threshold 500ms covers all cases
+                // v25.4: clear stale acceptedRecently — 2000ms threshold so the
+                // watchdog never preempts the longest setTimeout (1500ms single-slot).
+                // Each onAccepted path has its own setTimeout doing the precise removal;
+                // this is just a safety net for entries that leak (e.g. interrupted closures).
                 Object.keys(acceptedRecently).forEach(function(k){
-                    if (n - acceptedRecently[k] > 500) delete acceptedRecently[k];
+                    if (n - acceptedRecently[k] > 2000) delete acceptedRecently[k];
                 });
 
                 // Queue sync every 8s — moved here from scanner to keep scanner tight
@@ -2672,6 +2747,7 @@
             // Clear batchGroupIds and stop any running batch catcher loops
             Object.keys(batchGroupIds).forEach(function(gid){ if (groupTimers[gid]){ clearInterval(groupTimers[gid]); delete groupTimers[gid]; } });
             batchGroupIds = {};
+            acceptCountByGid = {}; // v25.4: reset per-gid accept counter on (re)start
             pendingAccepts = 0; pendingTimestamps = {};
             lastScanTime = now(); syncRunning = false;
             try { GM_setValue(WAS_RUNNING, '0'); } catch(e){}
@@ -2978,11 +3054,6 @@
             }
         }
 
-        // Removed UI sections — kept as no-ops to avoid any legacy call errors
-        function updatePresets(){}
-        function updateValueFilters(){}
-        function updateSavedGroups(){}
-
         function toggleSection(key){
             var b = gel('b-' + key), a = gel('a-' + key); if (!b) return;
             state.sectionsCollapsed[key] = !state.sectionsCollapsed[key];
@@ -3076,7 +3147,6 @@
                     '<div class="lic-bar-ok">✓ Worker: ' + esc(widMasked) + '</div>' +
                 '</div>' +
             '</div>';
-
             h += '<div class="stat-grid">' +
                 '<div class="stat-cell"><div class="stat-label">STATUS</div><div class="mrp-sv sv-off" id="mrp-status-text">IDLE</div></div>' +
                 '<div class="stat-cell"><div class="stat-label">CAUGHT</div><div class="mrp-sv sv-good" id="mrp-accepted-count">0</div></div>' +
